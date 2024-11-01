@@ -134,6 +134,7 @@ function createColumn(title: string, status: Task['status']) {
       },
       drop: (e: DragEvent) => {
         e.preventDefault();
+        debugger;
         (e.currentTarget as HTMLElement).classList.remove('bg-gray-300');
         const task = draggedTask.get();
         if (task && task.status !== status) {
