@@ -1,29 +1,33 @@
-import type { NodeInstruction, TextBinding, AttributeBinding, ClassBinding, StyleBinding, ForBinding, IfBinding, EventBinding } from '../ir';
+import type { NodeInstruction, TextBinding, AttributeBinding, ClassBinding, StyleBinding, ForBinding, EventBinding, DynamicNode, Binding } from '../ir';
 import { BatchScheduler } from './batch';
 import { effect } from './effect';
 
+type DOMCache = {
+  nodes: Node[];
+  cleanup: (() => void)[];
+};
+
 export class DOMRenderer {
-  private cleanup: (() => void)[] = [];
+  private cache = new WeakMap<NodeInstruction, DOMCache>();
   private scheduler = BatchScheduler.getInstance();
-  private immediate = false;
+  private immediate: boolean;
 
   constructor(options: { immediate?: boolean } = {}) {
     this.immediate = options.immediate ?? false;
   }
-  
-  mount(
-    instruction: NodeInstruction,
-    container: Element
-  ): () => void {
-    const node = this.render(instruction);
-    container.appendChild(node);
+
+  mount(instruction: NodeInstruction, container: Element): () => void {
+    const { nodes, cleanup } = this.renderWithCache(instruction);
+    nodes.forEach(node => container.appendChild(node));
     
     return () => {
-      this.cleanup.forEach(fn => fn());
-      this.cleanup = [];
-      if (node.parentNode) {
-        node.parentNode.removeChild(node);
-      }
+      cleanup.forEach(fn => fn());
+      nodes.forEach(node => {
+        if (node.parentNode) {
+          node.parentNode.removeChild(node);
+        }
+      });
+      this.cache = new WeakMap();
     };
   }
 
@@ -35,189 +39,249 @@ export class DOMRenderer {
     }
   }
 
-  private render(instruction: NodeInstruction): Node {
-    if (instruction.type === 'static') {
-      return instruction.element;
+  private renderWithCache(instruction: NodeInstruction): { nodes: Node[]; cleanup: (() => void)[] } {
+    const cached = this.cache.get(instruction);
+    if (cached) {
+      return cached;
     }
 
+    const cleanup: (() => void)[] = [];
+    let nodes: Node[];
+
+    if (instruction.type === 'static') {
+      nodes = [instruction.element.cloneNode(true)];
+    } else {
+      const rendered = this.renderDynamic(instruction, cleanup);
+      nodes = Array.isArray(rendered) ? rendered : [rendered];
+    }
+
+    const cache = { nodes, cleanup };
+    this.cache.set(instruction, cache);
+    return cache;
+  }
+
+  private renderDynamic(instruction: DynamicNode, cleanup: (() => void)[]): Node | Node[] {
     const { target, bindings, children } = instruction;
 
+    // Handle For binding specially to avoid wrapper div
+    const forBinding = bindings.find(b => b.type === 'for') as ForBinding | undefined;
+    if (forBinding) {
+      return this.renderForBinding(forBinding, cleanup);
+    }
+
     bindings.forEach(binding => {
-      switch (binding.type) {
-        case 'text':
-          this.setupTextBinding(binding);
-          break;
-        case 'attribute':
-          this.setupAttributeBinding(binding);
-          break;
-        case 'event':
-          this.setupEventBinding(binding);
-          break;
-        case 'class':
-          this.setupClassBinding(binding);
-          break;
-        case 'style':
-          this.setupStyleBinding(binding);
-          break;
-        case 'for':
-          this.setupForBinding(binding);
-          break;
-        case 'if':
-          this.setupIfBinding(binding);
-          break;
-      }
+      const disposer = this.createBinding(binding);
+      if (disposer) cleanup.push(disposer);
     });
 
-    if (target instanceof Element) {
+    if (target instanceof Element && children.length > 0) {
       children.forEach(child => {
-        const childNode = this.render(child);
-        target.appendChild(childNode);
+        const { nodes: childNodes, cleanup: childCleanup } = this.renderWithCache(child);
+        cleanup.push(...childCleanup);
+        childNodes.forEach(node => target.appendChild(node));
       });
     }
 
     return target;
   }
 
-  private setupEventBinding(binding: EventBinding): void {
-    binding.element.addEventListener(binding.name, binding.handler);
-    this.cleanup.push(() => {
-      binding.element.removeEventListener(binding.name, binding.handler);
+  private createBinding(binding: Binding): (() => void) | void {
+    switch (binding.type) {
+      case 'text':
+        return this.createTextBinding(binding);
+      case 'attribute':
+        return this.createAttributeBinding(binding);
+      case 'class':
+        return this.createClassBinding(binding);
+      case 'style':
+        return this.createStyleBinding(binding);
+      case 'event':
+        return this.createEventBinding(binding);
+    }
+  }
+
+  private createTextBinding(binding: TextBinding): () => void {
+    return effect(() => {
+      const value = binding.signal.get();
+      this.scheduleUpdate(() => {
+        binding.node.textContent = String(value);
+      });
     });
   }
 
-  private setupTextBinding(binding: TextBinding): void {
-    this.cleanup.push(effect(() => {
-      const newContent = String(binding.signal.get());
-      const update = () => binding.node.textContent = newContent;
-      this.scheduleUpdate(update);
-    }));
-  }
-
-  private setupAttributeBinding(binding: AttributeBinding): void {
-    this.cleanup.push(effect(() => {
+  private createAttributeBinding(binding: AttributeBinding): () => void {
+    return effect(() => {
       const value = binding.signal.get();
-      const update = () => {
-        if (value === null) {
+      this.scheduleUpdate(() => {
+        if (value === null || value === undefined) {
           if (binding.name === 'value' && (binding.element instanceof HTMLInputElement || binding.element instanceof HTMLTextAreaElement)) {
-            binding.element.value = ''
+            binding.element.value = '';
           } else {
             binding.element.removeAttribute(binding.name);
           }
         } else {
           if (binding.name === 'value' && (binding.element instanceof HTMLInputElement || binding.element instanceof HTMLTextAreaElement)) {
-            binding.element.value = String(value)
+            binding.element.value = String(value);
           } else {
             binding.element.setAttribute(binding.name, String(value));
           }
         }
-      };
-      this.scheduleUpdate(update);
-    }));
+      });
+    });
   }
 
-  private setupClassBinding(binding: ClassBinding): void {
-    this.cleanup.push(effect(() => {
+  private createClassBinding(binding: ClassBinding): () => void {
+    return effect(() => {
       const value = binding.signal.get();
-      const update = () => binding.element.classList.toggle(binding.name, Boolean(value));
-      this.scheduleUpdate(update);
-    }));
+      this.scheduleUpdate(() => {
+        binding.element.classList.toggle(binding.name, Boolean(value));
+      });
+    });
   }
 
-  private setupStyleBinding(binding: StyleBinding): void {
-    this.cleanup.push(effect(() => {
+  private createStyleBinding(binding: StyleBinding): () => void {
+    return effect(() => {
       const value = binding.signal.get();
-      const update = () => {
+      this.scheduleUpdate(() => {
         if (value === null) {
           binding.element.style.removeProperty(binding.property);
         } else {
           binding.element.style.setProperty(binding.property, String(value));
         }
-      };
-      this.scheduleUpdate(update);
-    }));
+      });
+    });
   }
 
-  private setupForBinding<T>(binding: ForBinding<T>): void {
-    this.cleanup.push(effect(() => {
+  private createEventBinding(binding: EventBinding): () => void {
+    binding.element.addEventListener(binding.name, binding.handler);
+    return () => {
+      binding.element.removeEventListener(binding.name, binding.handler);
+    };
+  }
+
+  private renderForBinding<T>(binding: ForBinding<T>, parentCleanup: (() => void)[]): Node[] {
+    const itemMap = new Map<any, {
+      nodes: Node[];
+      cleanup: (() => void)[];
+      item: T;
+      instructions: NodeInstruction[];
+    }>();
+
+    const cleanup = effect(() => {
       const items = binding.items.get();
+      const updates: (() => void)[] = [];
       const newKeys = new Set<any>();
-      const fragment = document.createDocumentFragment();
-      let lastNode: Node = binding.anchor;
+      let currentNodes = Array.from(binding.parent.childNodes)
+        .filter(node => node !== binding.anchor) as ChildNode[];
 
-      items.forEach((item: T) => {
+      // First, generate all item templates and track new keys
+      const processedItems = items.flatMap((item: T) => {
         const key = binding.trackBy(item);
+        const instructions = binding.template(item);
+        if (instructions.length === 0) return [];
+        
         newKeys.add(key);
-
-        if (!binding.itemsMap.has(key)) {
-          const instructions = binding.template(item);
-          const nodes = instructions.map(instruction => this.render(instruction));
-          binding.itemsMap.set(key, instructions);
-          nodes.forEach(node => {
-            fragment.appendChild(node);
-            lastNode = node;
-          });
-        } else {
-          const nodes = binding.itemsMap.get(key)!;
-          nodes.forEach(node => {
-            if (node.type === 'dynamic') {
-              const domNode = node.target;
-              if (domNode.previousSibling !== lastNode) {
-                fragment.appendChild(domNode);
-              }
-              lastNode = domNode;
-            }
-          });
-        }
+        return [{ key, item, instructions }];
       });
 
-      const update = () => {
-        for (const [key, nodes] of binding.itemsMap) {
-          if (!newKeys.has(key)) {
-            nodes.forEach(node => {
-              if (node.type === 'dynamic') {
-                const parentNode = node.target.parentNode;
-                if (parentNode) {
-                  parentNode.removeChild(node.target);
-                }
-              }
+      // Process each item
+      processedItems.forEach(({ key, item, instructions }, index) => {
+        let entry = itemMap.get(key);
+        const needsUpdate = !entry || !itemsEqual(entry.item, item);
+
+        if (needsUpdate) {
+          // Clean up old entry if it exists
+          if (entry) {
+            entry.cleanup.forEach(cleanup => cleanup());
+            entry.nodes.forEach(node => {
+              const idx = currentNodes.indexOf(node as ChildNode);
+              if (idx !== -1) currentNodes.splice(idx, 1);
             });
-            binding.itemsMap.delete(key);
           }
+
+          // Create new nodes
+          const nodes: Node[] = [];
+          const itemCleanup: (() => void)[] = [];
+
+          instructions.forEach(instruction => {
+            const { nodes: itemNodes, cleanup } = this.renderWithCache(instruction);
+            nodes.push(...itemNodes);
+            itemCleanup.push(...cleanup);
+          });
+
+          entry = { nodes, cleanup: itemCleanup, item, instructions };
+          itemMap.set(key, entry);
         }
-        binding.parent.appendChild(fragment);
-      };
 
-      this.scheduleUpdate(update);
-    }));
-  }
+        // Ensure entry is defined after potential update
+        if (!entry) return;
 
-  private setupIfBinding(binding: IfBinding): void {
-    this.cleanup.push(effect(() => {
-      const showTemplate = binding.condition.get();
-      const template = showTemplate ? binding.template : binding.elseTemplate || [];
+        // Schedule position update
+        entry.nodes.forEach((node, nodeIndex) => {
+          const currentIndex = currentNodes.indexOf(node as ChildNode);
+          const desiredIndex = index + nodeIndex;
 
-      const update = () => {
-        binding.currentNodes.forEach(node => {
-          if (node.type === 'dynamic') {
-            const parentNode = node.target.parentNode;
-            if (parentNode) {
-              parentNode.removeChild(node.target);
+          if (currentIndex === -1) {
+            // Node needs to be inserted
+            const referenceNode = currentNodes[desiredIndex] || binding.anchor;
+            if (referenceNode.parentNode) {
+              updates.push(() => referenceNode.parentNode!.insertBefore(node, referenceNode));
+            }
+            currentNodes.splice(desiredIndex, 0, node as ChildNode);
+          } else if (currentIndex !== desiredIndex) {
+            // Node needs to move
+            currentNodes.splice(currentIndex, 1);
+            currentNodes.splice(desiredIndex, 0, node as ChildNode);
+            const referenceNode = currentNodes[desiredIndex + 1] || binding.anchor;
+            if (referenceNode.parentNode) {
+              updates.push(() => referenceNode.parentNode!.insertBefore(node, referenceNode));
             }
           }
         });
+      });
 
-        const instructions = template.map(instruction => this.render(instruction));
-        const fragment = document.createDocumentFragment();
-        instructions.forEach(node => fragment.appendChild(node));
-        binding.parent.insertBefore(fragment, binding.anchor);
-        binding.currentNodes = template;
-      };
+      // Remove old items
+      const removals: (() => void)[] = [];
+      for (const [key, entry] of itemMap) {
+        if (!newKeys.has(key)) {
+          entry.cleanup.forEach(cleanup => cleanup());
+          entry.nodes.forEach(node => {
+            removals.push(() => {
+              if (node.parentNode) {
+                node.parentNode.removeChild(node);
+              }
+            });
+          });
+          itemMap.delete(key);
+        }
+      }
 
-      this.scheduleUpdate(update);
-    }));
+      // Execute updates
+      this.scheduleUpdate(() => {
+        removals.forEach(remove => remove());
+        updates.forEach(update => update());
+      });
+    });
+
+    parentCleanup.push(cleanup);
+    return [binding.anchor];
   }
 
   static flushUpdates(): void {
     BatchScheduler.getInstance().flush();
   }
+}
+
+// Helper function to compare items
+function itemsEqual<T>(a: T, b: T): boolean {
+  if (a === b) return true;
+  if (typeof a !== 'object' || typeof b !== 'object') return false;
+  if (a === null || b === null) return false;
+
+  const keysA = Object.keys(a);
+  const keysB = Object.keys(b);
+
+  if (keysA.length !== keysB.length) return false;
+
+  return keysA.every(key => (a as any)[key] === (b as any)[key]);
 }
